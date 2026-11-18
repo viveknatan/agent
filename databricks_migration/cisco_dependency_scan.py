@@ -11,7 +11,7 @@
 # MAGIC
 # MAGIC | Step | What | Source |
 # MAGIC |---|---|---|
-# MAGIC | 1 | Seed list = every table in the Cisco / Acqueon schemas you name | `information_schema.tables` + lineage |
+# MAGIC | 1 | Seed list = every table in the Cisco / Acqueon schemas **and external (foreign) catalogs** you name | `information_schema.tables` + lineage |
 # MAGIC | 2 | Walk table lineage outward from the seeds, any number of hops | `system.access.table_lineage` |
 # MAGIC | 3 | Who writes each impacted table (jobs, pipelines, notebooks) | lineage + `system.lakeflow.*` |
 # MAGIC | 4 | Who reads the seeds / impacted tables (dashboards, queries, notebooks, people) | lineage |
@@ -31,7 +31,7 @@
 # MAGIC * You only see lineage for objects you have privileges on. Run as a metastore admin (or a principal
 # MAGIC   with broad `BROWSE`) or the result will be silently incomplete.
 # MAGIC
-# MAGIC **To run:** fill in the `1. Source schemas` widget (required), review the others, then Run All.
+# MAGIC **To run:** fill in `1. Source schemas` and / or `1b. Source catalogs` (at least one), review the others, then Run All.
 # MAGIC Works on serverless or a UC-enabled cluster.
 
 # COMMAND ----------
@@ -42,6 +42,7 @@
 # COMMAND ----------
 
 dbutils.widgets.text("source_schemas", "", "1. Source schemas (catalog.schema, comma-sep)")
+dbutils.widgets.text("source_catalogs", "", "1b. Source catalogs - whole catalog, e.g. foreign catalogs on the Cisco DBs (comma-sep)")
 dbutils.widgets.text("extra_source_tables", "", "2. Extra source tables (catalog.schema.table, comma-sep)")
 dbutils.widgets.text("exclude_schemas", "", "3. Schemas to ignore downstream (catalog.schema, comma-sep)")
 dbutils.widgets.text("lineage_lookback_days", "365", "4. Lineage lookback (days)")
@@ -79,6 +80,7 @@ def _csv(name):
 
 
 SOURCE_SCHEMAS = _csv("source_schemas")
+SOURCE_CATALOGS = _csv("source_catalogs")
 EXTRA_SOURCE_TABLES = _csv("extra_source_tables")
 EXCLUDE_SCHEMAS = _csv("exclude_schemas")
 LINEAGE_DAYS = int(dbutils.widgets.get("lineage_lookback_days"))
@@ -87,8 +89,11 @@ KEYWORD_REGEX = dbutils.widgets.get("keyword_regex").strip()
 OUTPUT_SCHEMA = dbutils.widgets.get("output_schema").strip()
 OUTPUT_PREFIX = dbutils.widgets.get("output_prefix").strip()
 
-if not SOURCE_SCHEMAS and not EXTRA_SOURCE_TABLES:
-    raise ValueError("Set widget '1. Source schemas' to the Cisco / Acqueon schemas, e.g. raw.cisco_wxcce, raw.acqueon")
+if not SOURCE_SCHEMAS and not SOURCE_CATALOGS and not EXTRA_SOURCE_TABLES:
+    raise ValueError("Set widget '1. Source schemas' (e.g. raw.cisco_wxcce, raw.acqueon) and / or '1b. Source catalogs'")
+for c in SOURCE_CATALOGS:
+    if not re.fullmatch(r"[\w-]+", c):
+        raise ValueError(f"'{c}' must be a bare catalog name")
 for s in SOURCE_SCHEMAS + EXCLUDE_SCHEMAS:
     if not re.fullmatch(r"[\w-]+\.[\w-]+", s):
         raise ValueError(f"'{s}' must be catalog.schema")
@@ -99,6 +104,7 @@ if KEYWORD_REGEX:
     re.compile(KEYWORD_REGEX)
 
 print("Source schemas      :", SOURCE_SCHEMAS)
+print("Source catalogs     :", SOURCE_CATALOGS)
 print("Extra source tables :", EXTRA_SOURCE_TABLES)
 print("Ignored downstream  :", EXCLUDE_SCHEMAS)
 print(f"Lineage lookback    : {LINEAGE_DAYS} days | query-history lookback: {QH_DAYS} days")
@@ -181,14 +187,73 @@ lineage.createOrReplaceTempView("_lin")
 # COMMAND ----------
 
 # MAGIC %md
+# MAGIC ## 0c. External (foreign) catalogs - discovery and text-scan patterns
+# MAGIC Lists every Lakehouse Federation catalog in the metastore with its connection, and whether it is in
+# MAGIC widget 1b. A foreign catalog whose name or connection matches the keyword regex but is **not** selected
+# MAGIC is called out - add it to widget 1b and re-run. Connection names of the selected catalogs are added to
+# MAGIC the text scans in section 6, to catch code that goes through the connection directly
+# MAGIC (`remote_query(...)`) rather than through the catalog. Best effort: needs the Databricks SDK.
+
+# COMMAND ----------
+
+CONNECTION_NAMES = set()
+try:
+    from databricks.sdk import WorkspaceClient
+
+    _rows = []
+    for _c in WorkspaceClient().catalogs.list():
+        _conn = getattr(_c, "connection_name", None)
+        if "FOREIGN" not in str(getattr(_c, "catalog_type", "")).upper() and not _conn:
+            continue
+        _name = (_c.name or "").lower()
+        _selected = _name in SOURCE_CATALOGS
+        _looks_cisco = bool(KEYWORD_REGEX and re.search(KEYWORD_REGEX, f"{_name} {_conn or ''} {_c.comment or ''}", re.I))
+        if _selected and _conn:
+            CONNECTION_NAMES.add(_conn.lower())
+        _rows.append((_name, _conn, _c.owner, _c.comment, _selected, _looks_cisco and not _selected))
+    if _rows:
+        display(
+            spark.createDataFrame(
+                _rows, "catalog string, connection string, owner string, comment string, selected boolean, LOOKS_CISCO_BUT_NOT_SELECTED boolean"
+            ).orderBy(F.desc("LOOKS_CISCO_BUT_NOT_SELECTED"), F.desc("selected"), "catalog")
+        )
+    else:
+        print("No foreign catalogs visible to this principal.")
+    _unknown = [c for c in SOURCE_CATALOGS if c not in {r[0] for r in _rows}]
+    if _unknown:
+        print("NOTE - in widget 1b but not a foreign catalog (fine if intentional):", _unknown)
+except Exception as e:  # noqa: BLE001
+    print("Foreign catalog discovery skipped:", str(e).splitlines()[0][:160])
+
+# Regexes for scanning SQL text. Identifiers may be back-quoted; the look-behind stops `x.cisco_fed.` matching.
+_ident = r"`?[\w$-]+`?"
+_schema_patterns = []
+for s in SOURCE_SCHEMAS:
+    cat, sch = s.split(".")
+    _schema_patterns.append(rf"(?<![\w.`])`?{re.escape(cat)}`?\s*\.\s*`?{re.escape(sch)}`?\s*\.")
+_catalog_patterns = [rf"(?<![\w.`])`?{re.escape(c)}`?\s*\.\s*{_ident}\s*\." for c in SOURCE_CATALOGS]
+_connection_patterns = [rf"\b{re.escape(c)}\b" for c in sorted(CONNECTION_NAMES)]
+CATALOG_REGEX = "(?i)(" + "|".join(_catalog_patterns) + ")" if _catalog_patterns else None
+TEXT_REGEX = "(?i)(" + "|".join(
+    _schema_patterns + _catalog_patterns + _connection_patterns + ([KEYWORD_REGEX] if KEYWORD_REGEX else [])
+) + ")"
+print("Text-scan regex:", TEXT_REGEX)
+
+# COMMAND ----------
+
+# MAGIC %md
 # MAGIC ## 1. Seed list - the Cisco / Acqueon source tables
-# MAGIC Union of (a) what exists today in the source schemas, (b) names seen in lineage for those schemas
+# MAGIC Union of (a) what exists today in the source schemas and source catalogs, (b) names seen in lineage for those schemas
 # MAGIC (catches tables that were dropped or renamed during the lookback window), (c) the extra tables widget.
 
 # COMMAND ----------
 
 _schema_list = ", ".join(f"'{s}'" for s in SOURCE_SCHEMAS)
-schema_pred = f"substring_index(t, '.', 2) IN ({_schema_list})" if SOURCE_SCHEMAS else "FALSE"
+_catalog_list = ", ".join(f"'{c}'" for c in SOURCE_CATALOGS)
+schema_pred = " OR ".join(
+    ([f"substring_index(t, '.', 2) IN ({_schema_list})"] if SOURCE_SCHEMAS else [])
+    + ([f"substring_index(t, '.', 1) IN ({_catalog_list})"] if SOURCE_CATALOGS else [])
+) or "FALSE"
 
 seed_parts = [
     spark.sql("SELECT DISTINCT src AS t FROM _lin WHERE src IS NOT NULL").where(schema_pred),
@@ -206,7 +271,7 @@ for p in seed_parts[1:]:
 SEEDS = {r.t for r in seed_df.distinct().collect()} | set(EXTRA_SOURCE_TABLES)
 
 if not SEEDS:
-    raise RuntimeError("No tables found in the source schemas - check the widget values and your privileges.")
+    raise RuntimeError("No tables found in the source schemas / catalogs - check the widget values and your privileges.")
 
 
 def schema_of(full_name):
@@ -220,6 +285,7 @@ print(f"{len(SEEDS)} source tables")
 for s, n in sorted(seed_counts.items()):
     print(f"  {s:<60} {n}")
 missing = [s for s in SOURCE_SCHEMAS if s not in seed_counts]
+missing += [c for c in SOURCE_CATALOGS if not any(k.split(".")[0] == c for k in seed_counts)]
 if missing:
     print("WARNING - no tables found for:", missing)
 
@@ -346,6 +412,57 @@ impacted_tables = spark.sql(
     """
 )
 display(impacted_tables)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 2c. Tables and views pointing straight at the external (foreign) Cisco catalogs
+# MAGIC Everything one hop from a catalog in widget 1b, found two independent ways: lineage (it was read in the
+# MAGIC lookback window) and view SQL (the definition names the catalog, whether or not anyone queried it).
+# MAGIC These break the moment the Cisco databases or the connection are switched off - no pipeline needs to
+# MAGIC fail first, because a foreign catalog is a live pass-through to the source system.
+# MAGIC `found_by = view_definition` only means a view that exists but has not been queried in the window.
+
+# COMMAND ----------
+
+foreign_dependents = None
+if not SOURCE_CATALOGS:
+    print("Widget 1b is blank - skipped.")
+else:
+    _fed = defaultdict(set)
+    for _s, _t in edge_pairs:
+        if _s.split(".")[0] in SOURCE_CATALOGS and _t not in SEEDS:
+            _fed[_t].add(_s)
+    by_lineage = spark.createDataFrame(
+        [(t, sorted(v)) for t, v in _fed.items()], "table_full_name string, foreign_tables_read array<string>"
+    )
+    if AVAILABLE["views"]:
+        by_ddl = (
+            spark.table(TBL["views"])
+            .where(~F.lower("table_catalog").isin(SOURCE_CATALOGS))
+            .where(F.col("view_definition").rlike(CATALOG_REGEX))
+            .select(
+                F.lower(F.concat_ws(".", "table_catalog", "table_schema", "table_name")).alias("table_full_name"),
+                F.array_sort(F.array_distinct(F.regexp_extract_all(F.lower("view_definition"), F.lit(CATALOG_REGEX), 1))).alias("references_in_sql"),
+            )
+        )
+    else:
+        print(f"{TBL['views']} not readable - lineage only.")
+        by_ddl = spark.createDataFrame([], "table_full_name string, references_in_sql array<string>")
+    foreign_dependents = (
+        by_lineage.join(by_ddl, "table_full_name", "full_outer")
+        .join(spark.table("_meta").select("table_full_name", "table_type", "table_owner"), "table_full_name", "left")
+        .withColumn(
+            "found_by",
+            F.expr(
+                """CASE WHEN foreign_tables_read IS NOT NULL AND references_in_sql IS NOT NULL THEN 'lineage + view_definition'
+                        WHEN foreign_tables_read IS NOT NULL THEN 'lineage' ELSE 'view_definition' END"""
+            ),
+        )
+        .select("table_full_name", "table_type", "table_owner", "found_by", "foreign_tables_read", "references_in_sql")
+        .orderBy("found_by", "table_full_name")
+    )
+    display(foreign_dependents)
 
 # COMMAND ----------
 
@@ -609,19 +726,10 @@ if column_impact is not None:
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### 6a. Views whose SQL references a Cisco schema but that lineage did not flag
+# MAGIC ### 6a. Views whose SQL references a Cisco schema / catalog / connection but that lineage did not flag
 # MAGIC Typically views nobody queried inside the lookback window - still broken on day 1 if the source goes away.
 
 # COMMAND ----------
-
-# Matches catalog.schema. with optional backticks, plus the free-form keyword regex.
-_schema_patterns = []
-for s in SOURCE_SCHEMAS:
-    cat, sch = s.split(".")
-    _schema_patterns.append(rf"`?{re.escape(cat)}`?\s*\.\s*`?{re.escape(sch)}`?\s*\.")
-SCHEMA_REGEX = "(?i)(" + "|".join(_schema_patterns) + ")" if _schema_patterns else None
-TEXT_REGEX = "(?i)(" + "|".join(_schema_patterns + ([KEYWORD_REGEX] if KEYWORD_REGEX else [])) + ")"
-print("Text-scan regex:", TEXT_REGEX)
 
 unflagged_views = None
 if not AVAILABLE["views"]:
@@ -645,7 +753,7 @@ else:
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### 6b. Query history: statements mentioning Cisco schemas / keywords with no lineage record
+# MAGIC ### 6b. Query history: statements mentioning Cisco schemas / catalogs / connections / keywords with no lineage record
 # MAGIC Catches SQL-warehouse and serverless traffic that lineage did not attribute - BI tools, JDBC/ODBC
 # MAGIC extracts, failed-but-scheduled queries. Grouped by who / what client / which asset. Keyword hits can be
 # MAGIC false positives (the word in a comment or column alias); read `sample_statement` before acting.
@@ -772,6 +880,7 @@ summary = [
     ("Cisco / Acqueon source tables (seeds)", len(SEEDS)),
     ("Downstream tables / views impacted", len(IMPACTED)),
     ("  ...reading Cisco directly (1 hop)", by_hop.get(1, 0)),
+    ("  ...pointing at the external Cisco catalogs", _n(foreign_dependents)),
     ("  ...read by someone in the last 30 days", _n(impacted_tables, "readers_30d > 0")),
     ("Jobs writing Cisco-derived data", _n(writers, "entity_kind = 'JOB'")),
     ("Pipelines writing Cisco-derived data", _n(writers, "entity_kind = 'PIPELINE'")),
@@ -819,6 +928,7 @@ display(
 
 outputs = {
     "impacted_tables": impacted_tables,
+    "foreign_catalog_dependents": foreign_dependents,
     "writers": writers,
     "consumers": consumers,
     "column_impact": column_impact,
